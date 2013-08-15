@@ -1,22 +1,88 @@
-import sys
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+#
+import sys, os, random, re
 import lxml.html
 from twisted.internet import reactor, task, defer, protocol
 from twisted.python import log
 from twisted.words.protocols import irc
 from twisted.web.client import getPage
 from twisted.application import internet, service
+from collections import defaultdict
 HOST, PORT = 'irc.freenode.net', 6667
 
-WHOAMI = 'I am NixalBot, a faithful and watchful bot unleashed by my master to keep an eye on this channel.'
-WHENCEAMI = 'Since the last time you thought about the phase of the moon.'
-WHATCANIDO = ("/msg me a `!ping' and I'll pong you; /msg me some text: `!saylater <delay-in-seconds> <sometext>' and "
-            + "I'll show ya how sharp my memory is.")
+WHO_AM_I = 'I am NixalBot, a faithful and watchful bot unleashed by my master to keep an eye on this channel.'
+WHENCE_AM_I = 'Since the last time you thought about the phase of the moon.'
+WHAT_CAN_I_DO = ("/msg me a `!ping' and I'll pong you; /msg me some text: `!saylater <delay-in-seconds> <sometext>' and "
+                + "I'll show ya how sharp my memory is. Talk to me for more.")
 
 DEFAULT = "Sorry, I don't understand your mutilated language. STFU."
 
+#-------------------------------------------------------------------------------
+# Markov chain sentence generator, from
+# http://eflorenzano.com/blog/2008/11/16/writing-markov-chain-irc-bot-twisted-and-python/
+#-------------------------------------------------------------------------------
+class MarkovGenerator(object):
+    def __init__(self, stop_word='\n'):
+        self.markov = defaultdict(list)
+        self.stop_word = stop_word
 
-class MyFirstIRCProtocol(irc.IRCClient):
+    def train(self, msg, chain_length, write_to_file=False):
+        if write_to_file:
+            fp = open('training.txt', 'a')
+            fp.write(msg + '\n')
+            fp.close()
+        buf = [self.stop_word] * chain_length
+        for word in msg.split():
+            # For each sliding window of length chain_length, add the following 
+            # word to the list of possible words.
+            self.markov[tuple(buf)].append(word)
+            # slide the window:
+            del buf[0]
+            buf.append(word)
+        self.markov[tuple(buf)].append(self.stop_word)
+
+    def generate(self, msg, chain_length, max_words=10000):
+        tmp = msg.split()
+        buf = tmp[:chain_length]
+        if len(tmp) > chain_length:
+            message = buf[:]
+        else:
+            message = []
+            i = chain_length
+            while i:
+                try:
+                    message.append(
+                        random.choice(
+                            self.markov[random.choice(self.markov.keys())]))
+                except IndexError:
+                    message.append(random.choice(( 
+                                                  'umm..', 
+                                                  'now,', 
+                                                  'look,', 
+                                                  'okay,')))
+
+                i -= 1
+
+        ectr = 0
+        for i in xrange(max_words):
+            try:
+                next_word = random.choice(self.markov[tuple(buf)])
+            except IndexError:
+                ectr += 1
+                continue
+            if next_word == self.stop_word:
+                print('breaking off at i = %d' % i)
+                break
+            message.append(next_word)
+            del buf[0]
+            buf.append(next_word)
+        print(ectr)
+        return ' '.join(message)
+
+class YIRCProtocol(irc.IRCClient):
     nickname = 'NixalBot'
+    mentioned_regex = re.compile(nickname + r"\s*[:,]* ?", re.I)
 
     def signedOn(self):
         # This is called once the server has acknowledged that we sent
@@ -29,18 +95,29 @@ class MyFirstIRCProtocol(irc.IRCClient):
         nick, _, host = user.partition('!')
         message = message.strip()
         # Check for a mention:
-        if message.startswith(self.nickname):
-            rest = message[len(self.nickname) + 1:].strip().lower()
+        prefix = ''
+        rest = message
+        if self.nickname in message:
+            rest = self.mentioned_regex.sub("", message).strip()
+            prefix = "{0}: ".format(nick)
             if rest == 'who are you?':
-                self.say(channel, nick + ': ' + WHOAMI)
+                self.say(channel, prefix + WHO_AM_I)
+                return
             elif rest == 'whence are you?':
-                self.say(channel, nick + ': ' + WHENCEAMI)
+                self.say(channel, prefix + WHENCE_AM_I)
+                return
             elif rest == 'what can you do?':
-                self.say(channel, nick + ': ' + WHATCANIDO)
-            else:
-                self.say(channel, nick + ': ' + DEFAULT)
+                self.say(channel, prefix + WHAT_CAN_I_DO)
+                return
         
-            return
+        self.factory.generator.train(rest, self.factory.chain_length, True)
+
+        if prefix or random.random() <= self.factory.chattiness:
+                sentence = self.factory.generator.generate(rest,
+                                                           self.factory.chain_length,
+                                                           self.factory.max_words)
+                if sentence:
+                    self.say(channel, prefix + sentence)
 
         if not message.startswith('!'): # not a trigger command
             return # do nothing
@@ -50,24 +127,11 @@ class MyFirstIRCProtocol(irc.IRCClient):
         # Or, if there was no function, ignore the message.
         if func is None:
             return
-        # maybeDeferred will always return a Deferred. It calls func(rest), and
-        # if that returned a Deferred, return that. Otherwise, return the return
-        # value of the function wrapped in twisted.internet.defer.succeed. If
-        # an exception was raised, wrap the traceback in
-        # twisted.internet.defer.fail and return that.
         d = defer.maybeDeferred(func, rest)
-        # Add callbacks to deal with whatever the command results are.
-        # If the command gives error, the _show_error callback will turn the 
-        # error into a terse message first:
         d.addErrback(self._show_error)
-        # Whatever is returned is sent back as a reply:
         if channel == self.nickname:
-            # When channel == self.nickname, the message was sent to the bot
-            # directly and not to a channel. So we will answer directly too:
             d.addCallback(self._send_message, nick)
         else:
-            # Otherwise, send the answer to the channel, and use the nick
-            # as addressing in the message itself:
             d.addCallback(self._send_message, channel, nick)
 
     def _send_message(self, msg, target, nick=None):
@@ -85,66 +149,42 @@ class MyFirstIRCProtocol(irc.IRCClient):
         when, sep, msg = rest.partition(' ')
         when = int(when)
         d = defer.Deferred()
-        # A small example of how to defer the reply from a command. callLater
-        # will callback the Deferred with the reply after so many seconds.
         reactor.callLater(when, d.callback, msg)
-        # Returning the Deferred here means that it'll be returned from
-        # maybeDeferred in privmsg.
         return d
 
     def command_title(self, url):
         d = getPage(url)
-        # Another example of using Deferreds. twisted.web.client.getPage returns
-        # a Deferred which is called back when the URL requested has been
-        # downloaded. We add a callback to the chain which will parse the page
-        # and extract only the title. If we just returned the deferred instead,
-        # the function would still work, but the reply would be the entire
-        # contents of the page.
-        # After that, we add a callback that will extract the title
-        # from the parsed tree lxml returns
         d.addCallback(self._parse_pagetitle, url)
         return d
 
     def _parse_pagetitle(self, page_contents, url):
-        # Parses the page into a tree of elements:
         pagetree = lxml.html.fromstring(page_contents)
-        # Extracts the title text from the lxml document using xpath
         title = u' '.join(pagetree.xpath('//title/text()')).strip()
-        # Since lxml gives you unicode and unicode data must be encoded
-        # to send over the wire, we have to encode the title. Sadly IRC predates
-        # unicode, so there's no formal way of specifying the encoding of data
-        # transmitted over IRC. UTF-8 is our best bet, and what most people use.
         title = title.encode('utf-8')
-        # Since we're returning this value from a callback, it will be passed in
-        # to the next callback in the chain (self._send_message).
         return '%s -- "%s"' % (url, title)
 
-class MyFirstIRCFactory(protocol.ReconnectingClientFactory):
-    protocol = MyFirstIRCProtocol
+class YIRCFactory(protocol.ReconnectingClientFactory):
+    protocol = YIRCProtocol
     channels = ['#nixal']
+    chain_length = 2
+    chattiness = 0.05 # 0 to 1.0
+    max_words = 10000
+    generator = MarkovGenerator()
+
+    def __init__(self):
+        if os.path.exists('training.txt'):
+            fp = open('training.txt', 'r')
+            for line in fp:
+                self.generator.train(line, self.chain_length)
+            fp.close()
 
 if __name__ == '__main__':
-    # This runs the program in the foreground. We tell the reactor to connect
-    # over TCP using a given factory, and once the reactor is started, it will
-    # open that connection.
-    reactor.connectTCP(HOST, PORT, MyFirstIRCFactory())
-    # Since we're running in the foreground anyway, show what's happening by
-    # logging to stdout.
+    reactor.connectTCP(HOST, PORT, YIRCFactory())
     log.startLogging(sys.stdout)
-    # And this starts the reactor running. This call blocks until everything is
-    # done, because this runs the whole twisted mainloop.
     reactor.run()
 
-# This runs the program in the background. __name__ is __builtin__ when you use
-# twistd -y on a python module.
 elif __name__ == '__builtin__':
-    # Create a new application to which we can attach our services. twistd wants
-    # an application object, which is how it knows what services should be
-    # running. This simplifies startup and shutdown.
-    application = service.Application('MyFirstIRCBot')
-    # twisted.application.internet.TCPClient is how to make a TCP client service
-    # which we can attach to the application.
-    ircService = internet.TCPClient(HOST, PORT, MyFirstIRCFactory())
+    application = service.Application('NixalBot')
+    ircService = internet.TCPClient(HOST, PORT, YIRCFactory())
     ircService.setServiceParent(application)
-    # twistd -y looks for a global variable in this module named 'application'.
-    # Since there is one now, and it's all set up, there's nothing left to do.
+
